@@ -48,6 +48,7 @@ class HingeBarge(cpt.FloatingBody):
         # Merge the bodies together
         tmp_barge = cpt.FloatingBody.join_bodies(*self.bodies)
 
+        self.dofs_names = dofs_names
         actual_dofs = {}
         self.transformation_matrix = []
         for dof_name in dofs_names:
@@ -214,6 +215,10 @@ class HingeBarge(cpt.FloatingBody):
             'rho': rho_water,
         })
         self.dataset = cpt.Nemoh(linear_solver="gmres").fill_dataset(dataset, [self])
+
+        # Reorder dofs
+        self.dataset = self.dataset.sel(radiating_dof=self.dofs_names, influenced_dof=self.dofs_names)
+
         return self.dataset
 
     ####################
