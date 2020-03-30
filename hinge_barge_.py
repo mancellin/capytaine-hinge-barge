@@ -7,6 +7,34 @@ import xarray as xr
 import pandas as pd
 import capytaine as cpt
 
+
+def rigid_body_mass_matrix(body, rho_water):
+    if isinstance(body, cpt.RectangularParallelepiped):
+        draught = -body.mesh.vertices[:, 2].min()
+        mass = rho_water * body.size[0] * body.size[1] * draught
+        return np.diag([
+            mass, mass, mass,
+            mass * (body.size[1]**2 + body.size[2]**2)/12 + mass*(body.geometric_center[2]**2), # Roll
+            mass * (body.size[0]**2 + body.size[2]**2)/12 + mass*(body.geometric_center[2]**2), # Pitch
+            mass * (body.size[0]**2 + body.size[1]**2)/12,                                      # Yaw
+        ])
+    else:
+        raise NotImplementedError
+
+
+def rigid_body_hydrostatic_stiffness(body, rho_water, g):
+    if isinstance(body, cpt.RectangularParallelepiped):
+        draught = -body.mesh.vertices[:, 2].min()
+        immersed_vol = body.size[0] * body.size[1] * draught
+        matrix = np.zeros((6, 6), dtype=np.float64)
+        matrix[2, 2] = rho_water * g * body.size[0] * body.size[1]
+        matrix[3, 3] = rho_water * g * immersed_vol * abs(body.geometric_center[2] + draught/2)
+        matrix[4, 4] = rho_water * g * immersed_vol * abs(body.geometric_center[2] + draught/2)
+        return matrix
+    else:
+        raise NotImplementedError
+
+
 class HingeBarge(cpt.FloatingBody):
     def __init__(self, *, bodies, distance_between_bodies, center=(0, 0, 0), name=None):
         self.components = [body.copy() for body in bodies]
@@ -68,14 +96,14 @@ class HingeBarge(cpt.FloatingBody):
 
     def compute_mass_matrix(self, rho_water=1000.0):
         try:
-            comp_mass_matrices = [comp.rigid_body_mass_matrix(rho_water) for comp in self.components]
+            comp_mass_matrices = [rigid_body_mass_matrix(comp, rho_water) for comp in self.components]
         except:
             raise Exception("Could not compute the mass matrix of the components of the hinge-barge.")
         self.mass = self.add_dofs_labels_to_matrix(self.P @ block_diag(*comp_mass_matrices) @ self.P.T)
 
     def compute_hydrostatic_stiffness(self, rho_water=1000.0, g=9.81):
         try:
-            comp_hs = [comp.rigid_body_hydrostatic_stiffness(rho_water, g) for comp in self.components]
+            comp_hs = [rigid_body_hydrostatic_stiffness(comp, rho_water, g) for comp in self.components]
         except:
             raise Exception("Could not compute the mass matrix of the components of the hinge-barge.")
         self.hydrostatic_stiffness = self.add_dofs_labels_to_matrix(self.P @ block_diag(*comp_hs) @ self.P.T)
