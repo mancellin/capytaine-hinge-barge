@@ -1,261 +1,197 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from collections import namedtuple
-
 import numpy as np
+from scipy.linalg import block_diag
 import xarray as xr
 import pandas as pd
-from scipy.linalg import block_diag
-
 import capytaine as cpt
-from meshmagick.hydrostatics import Hydrostatics
 
-RectangleParams = namedtuple("RectangleParams", ["name", "shape", "geometric_center", "center_of_mass", "resolution"])
 
-DEFAULT_BODY_1 = RectangleParams(name="body_1", shape=(0.68, 0.4, 0.10), geometric_center=(0.0, 0.0, 0.0), center_of_mass=(0.0, 0.0, -0.025), resolution=10)
-DEFAULT_BODY_2 = RectangleParams(name="body_2", shape=(0.28, 0.4, 0.15), geometric_center=(0.0, 0.0, 0.0), center_of_mass=(0.0, 0.0, -0.025), resolution=10)
-DEFAULT_BODY_3 = RectangleParams(name="body_3", shape=(1.00, 0.4, 0.10), geometric_center=(0.0, 0.0, 0.0), center_of_mass=(0.0, 0.0, -0.025), resolution=10)
-DEFAULT_DAMPING_PLATE = RectangleParams(name="damping_plate", shape=(0.48, 0.4, 0.01), geometric_center=(0.0, 0.0, -0.227), center_of_mass=(0.0, 0.0, -0.227), resolution=10)
-DEFAULT_BARGE = ((DEFAULT_BODY_1,), (DEFAULT_BODY_2, DEFAULT_DAMPING_PLATE), (DEFAULT_BODY_3,))
-DEFAULT_DOFS = ['Heave', 'Pitch', 'body_1__Relative_Pitch', 'body_3__Relative_Pitch']
+def rigid_body_mass_matrix(body, rho_water):
+    """Compute the mass matrix for a body with the six rigid body dofs."""
+    if hasattr(body, "mass"):
+        return body.mass
+    elif isinstance(body, cpt.RectangularParallelepiped):
+        draught = -body.mesh.vertices[:, 2].min()
+        mass = rho_water * body.size[0] * body.size[1] * draught
+        mass_matrix = np.diag([
+            mass, mass, mass,
+            mass * (body.size[1]**2 + body.size[2]**2)/12 + mass*(body.geometric_center[2]**2), # Roll
+            mass * (body.size[0]**2 + body.size[2]**2)/12 + mass*(body.geometric_center[2]**2), # Pitch
+            mass * (body.size[0]**2 + body.size[1]**2)/12,                                      # Yaw
+        ])
+        body.mass_matrix = mass_matrix
+        return mass_matrix
+    else:
+        raise NotImplementedError
+
+
+def rigid_body_hydrostatic_stiffness(body, rho_water, g):
+    """Compute the stiffness matrix for a body with the six rigid body dofs."""
+    if hasattr(body, "hydrostatic_stiffness"):
+        return body.hydrostatic_stiffness
+    elif isinstance(body, cpt.RectangularParallelepiped):
+        draught = -body.mesh.vertices[:, 2].min()
+        immersed_vol = body.size[0] * body.size[1] * draught
+        matrix = np.zeros((6, 6), dtype=np.float64)
+        matrix[2, 2] = rho_water * g * body.size[0] * body.size[1]
+        matrix[3, 3] = rho_water * g * immersed_vol * abs(body.geometric_center[2] + draught/2)
+        matrix[4, 4] = rho_water * g * immersed_vol * abs(body.geometric_center[2] + draught/2)
+        body.hydrostatic_stiffness = matrix
+        return matrix
+    else:
+        raise NotImplementedError
 
 
 class HingeBarge(cpt.FloatingBody):
-    """The purpose of this class is to generate a capytaine.FloatingBody
-    that represents a hinge-barge with an arbitrary number of bodies.
-    Each body can be composed of several rectangular parallelepiped moving together.
+    """Floating body combining several rigid bodies to form a hinge-barge.
+
+    During initilization, the components of the barge are aligned along the
+    x-axis with a given space between them.
+    The hinge-barge is initialized with 6 + nb_hinges degrees of freedom.
+
+    Parameters
+    ==========
+    components: sequence of :code:`FloatingBody`
+        The bodies that are bundled together to form the hinge-berge.
+    distance_between_bodies: float
+        The empty space between two consecutive bodies.
+        It is the same for all hinges. (TODO: allow non-uniform spacing)
+    center: 3-ple of floats
+        The position of the center of the resulting hinge-barge
+    name: string
+        A name for the new hinge-barge
+
+    Attributes
+    ==========
+    nb_components: int
+        The number of bodies composing the hinge-barge.
+    nb_hinges: int
+        The number of hinges, that is nb_components - 1
     """
-
-    ##################
-    #  MESH AND DOF  #
-    ##################
-
-    def __init__(self, *,
-                 bodies=DEFAULT_BARGE,
-                 dofs_names=DEFAULT_DOFS,
-                 distance_between_bodies=0.06,
-                 center=(0.0, 0.0, 0.0)):
-        """Initialize the mesh and properties of a hinge-barge."""
-
-        self.bodies_params = bodies
-        self.center = np.array(center)
+    def __init__(self, *, components, distance_between_bodies, center=(0, 0, 0), name=None):
+        self.components = [body.copy() for body in components]
+        self.nb_components = len(self.components)
+        self.nb_hinges = len(self.components) - 1
         self.distance_between_bodies = distance_between_bodies
 
-        # Generate the meshes of the individual bodies
-        self._generate_meshes()
+        # MERGING BODIES
+        def width_of_body(body):
+            return body.mesh.vertices[:, 0].max() - body.mesh.vertices[:, 0].min()
+        widths = np.array([width_of_body(bd) for bd in self.components])
+        total_width = sum(widths) + self.nb_hinges*self.distance_between_bodies
 
-        # Merge the bodies together
-        tmp_barge = cpt.FloatingBody.join_bodies(*self.bodies)
+        x_corner_of_bodies = (
+            np.cumsum(np.concatenate([[0], widths[:-1]]))
+            + np.arange(0, self.nb_hinges+1)*self.distance_between_bodies
+            + center[0] - total_width/2
+        )
+        x_center_of_bodies = x_corner_of_bodies + widths/2
+        x_positions_of_hinges = x_corner_of_bodies[1:] - self.distance_between_bodies/2
 
-        self.dofs_names = dofs_names
+        for i, comp in enumerate(self.components):
+            comp.name = f"body_{i}"
+
+            # Reset dofs
+            comp.dofs = {}
+            comp.add_all_rigid_body_dofs()
+
+            # Position all bodies side by side
+            comp.translate_x(x_corner_of_bodies[i] - comp.mesh.vertices[:, 0].min())
+
+        merged_components = sum(self.components[1:], self.components[0])
+
+        # MERGING DOFS
+        self.P = np.zeros((6 + self.nb_hinges, 6*self.nb_components))
         actual_dofs = {}
-        self.transformation_matrix = []
-        for dof_name in dofs_names:
-            coeffs = self._global_dof_from_individual_dofs(dof_name)
-            self.transformation_matrix.append(coeffs)
-            actual_dofs[dof_name] = sum([coef * motion for coef, motion in zip(coeffs, tmp_barge.dofs.values())])
-        self.transformation_matrix = np.array(self.transformation_matrix)
+        for i_dof, dof in enumerate(["Surge", "Sway", "Heave", "Roll", "Pitch", "Yaw"]):
+            for j in range(self.nb_components):
+                self.P[i_dof, 6*j + i_dof] = 1.0
+                if dof == "Pitch":  # Also add some heave to the bodies far from the center
+                    self.P[i_dof, 6*j+2] = center[0] - x_center_of_bodies[j]
+                elif dof == "Yaw":  # Also add some sway to the bodies far from the center
+                    self.P[i_dof, 6*j+1] = x_center_of_bodies[j] - center[0]
 
-        cpt.FloatingBody.__init__(self, mesh=tmp_barge.mesh, dofs=actual_dofs, name="hinge_barge")
+            actual_dofs[dof] = sum(c * m for c, m in zip(self.P[i_dof, :], merged_components.dofs.values()))
 
-        # Position and clipping
-        self.translate(center)
-        self.keep_immersed_part()
+        for i_hinge in range(self.nb_hinges):
+            i_dof = 6 + i_hinge
+            for j in range(self.nb_components):
+                self.P[i_dof, 6*j + 2] = abs(x_positions_of_hinges[i_hinge] - x_center_of_bodies[j])   # Heave of body j
+                self.P[i_dof, 6*j + 4] = 1.0 if x_center_of_bodies[j] < x_positions_of_hinges[i_hinge] else -1.0  # Pitch of body j
 
-    @staticmethod
-    def _generate_mesh_of_a_parallelepiped(params: RectangleParams):
-        """Generate the mesh of a single parallelepiped using capytaine mesh generator."""
-        resolution = params.resolution*np.array(params.shape)
-        resolution = resolution.astype(np.int)
-        resolution[resolution < 1] = 1  # There should be at least one panel in each direction.
+            actual_dofs[f"Hinge_{i_hinge}"] = sum(c * m for c, m in zip(self.P[i_dof, :], merged_components.dofs.values()))
 
-        body = cpt.RectangularParallelepiped(
-            size=params.shape,
-            resolution=resolution,
-            center=params.geometric_center,
-            name=params.name,
-        )
-        body.center_of_mass = np.asarray(params.center_of_mass)
-        body.rotation_center = body.geometric_center
+        # REST OF THE INITIALIZATION
+        super().__init__(mesh=merged_components.mesh, dofs=actual_dofs, name=name)
 
-        return body
+    def compute_mass_matrix(self, rho_water=1000.0):
+        try:
+            comp_mass_matrices = [rigid_body_mass_matrix(comp, rho_water) for comp in self.components]
+        except:
+            raise Exception("Could not compute the mass matrix of the components of the hinge-barge.")
+        self.mass = self.add_dofs_labels_to_matrix(self.P @ block_diag(*comp_mass_matrices) @ self.P.T)
 
-    def _generate_meshes(self):
-        """Create the mesh of the bodies one after the other."""
-        self.bodies = []
-        x_position_of_next_body = 0.0
+    def compute_hydrostatic_stiffness(self, rho_water=1000.0, g=9.81):
+        try:
+            comp_hs = [rigid_body_hydrostatic_stiffness(comp, rho_water, g) for comp in self.components]
+        except:
+            raise Exception("Could not compute the mass matrix of the components of the hinge-barge.")
+        self.hydrostatic_stiffness = self.add_dofs_labels_to_matrix(self.P @ block_diag(*comp_hs) @ self.P.T)
 
-        for body_params in self.bodies_params:
-            main_subbody = self._generate_mesh_of_a_parallelepiped(body_params[0])
+    def compute_hydrostatics(self, rho_water=1000.0, g=9.81):
+        self.compute_mass_matrix(rho_water)
+        self.compute_hydrostatic_stiffness(rho_water, g)
 
-            body = main_subbody.copy()
-            for subbody_params in body_params[1:]:
-                body += self._generate_mesh_of_a_parallelepiped(subbody_params)
-
-            body.name = main_subbody.name
-            body.center_of_mass = main_subbody.center_of_mass
-            body.geometric_center = main_subbody.geometric_center
-
-            body.add_all_rigid_body_dofs()
-
-            body.translate_x(x_position_of_next_body + body_params[0].shape[0]/2)
-            x_position_of_next_body += body_params[0].shape[0] + self.distance_between_bodies
-
-            self.bodies.append(body)
-
-    def _global_dof_from_individual_dofs(self, dof_name):
-        """All the dofs of the hinge-barge can be seen as linear combination
-        of the rigid body dofs of the individual bodies composing the barge.
-        This function returns the coefficients used to sum the dofs of the
-        bodies to get a dof of the full barge.
-
-        Parameters
-        ----------
-        dof_name: str
-            The name of the dof of the full barge.
-            Accepted: 'Surge', 'Sway', 'Heave', 'Roll', 'Pitch', 'Yaw'
-                      'body_1__Relative_Pitch', 'body_3__Relative_Pitch'
-
-        Returns
-        -------
-        np.ndarray
-            array of 6*nb_bodies coefficients
-        """
-        vector = np.zeros(6*len(self.bodies), dtype=np.float64)
-        rigid_body_dofs = ['surge', 'sway', 'heave', 'roll', 'pitch', 'yaw']
-
-        if dof_name.lower() in rigid_body_dofs[:4]:
-            vector[rigid_body_dofs.index(dof_name.lower())::6] = 1.0
-            return vector
-
-        elif dof_name.lower() == 'pitch':
-            vector[rigid_body_dofs.index(dof_name.lower())::6] = 1.0
-            for i_body, body in enumerate(self.bodies):
-                vector[6*i_body+2] = -body.geometric_center[0] + self.center[0]
-            return vector
-
-        elif dof_name.lower() == 'yaw':
-            vector[rigid_body_dofs.index(dof_name.lower())::6] = 1.0
-            for i_body, body in enumerate(self.bodies):
-                vector[6*i_body+1] = body.geometric_center[0] - self.center[0]
-            return vector
-
-        # Specific dofs for the three-body hinge-barge
-        elif dof_name.lower() == 'body_1__relative_pitch':
-            a = self.bodies_params[0][0].shape[0]/2 + self.distance_between_bodies/2
-            return np.array([0, 0, a, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-
-        elif dof_name.lower() == 'body_3__relative_pitch':
-            c = self.bodies_params[2][0].shape[0]/2 + self.distance_between_bodies/2
-            return np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -c, 0, 1, 0])
-
-        else:
-            raise ValueError(f"Unrecognized dof name: {dof_name}")
-
-    def _transformation_matrix(self):
-        """Matrix of the coefficients discussed in the function above."""
-        return np.array([self._global_dof_from_individual_dofs(dof) for dof in self.dofs])
-
-    ####################################
-    #  HYDROSTATICS AND HYDRODYNAMICS  #
-    ####################################
-
-    def _compute_mass(self, rho_water):
-        """Compute the mass matrix for the hinge-barge by combining the mass matrices
-        of the individual parallelepiped composing the full hinge-barge."""
-
-        def mass_matrix(params):
-            """Mass matrix for a single rectangular parallelepiped.
-            The mass is computed from the displaced mass of water
-            because the body is assumed to be floating in equilibrium.
-            """
-            # TODO: Test for all center_of_mass and all dofs.
-            draught = params.shape[2]/2
-            mass = rho_water * params.shape[0] * params.shape[1] * draught
-            return np.diag([
-                mass, mass, mass,
-                (mass * (params.shape[1]**2 + params.shape[2]**2))/12 + mass*(params.center_of_mass[2]**2), # Roll
-                (mass * (params.shape[0]**2 + params.shape[2]**2))/12 + mass*(params.center_of_mass[2]**2), # Pitch
-                (mass * (params.shape[0]**2 + params.shape[1]**2))/12,                   # Yaw
-            ])
-        blocks = [sum(mass_matrix(body) for body in body_group) for body_group in self.bodies_params]
-        P = self._transformation_matrix()
-        self.mass = self.add_dofs_labels_to_matrix(P @ block_diag(*blocks) @ P.T)
-
-    def _compute_hydrostatic_stiffness(self, rho_water=1025.0):
-        """Compute the hydrostatic stiffness for the hinge-barge by combining the hydrostatic stiffnesses
-        of the individual parallelepiped composing the full hinge-barge."""
-
-        self.individual_hydrostatic_stiffness = []
-        for body in self.bodies:
-            self.individual_hydrostatic_stiffness.append(
-                Hydrostatics(body.mesh.merged().to_meshmagick(), rho_water=rho_water).hs_data['stiffness_matrix']
-            )
-
-        individual_hs = [np.zeros((6, 6)) for _ in range(len(self.bodies))]
-        for i in range(len(self.bodies)):
-            individual_hs[i][2:5, 2:5] = self.individual_hydrostatic_stiffness[i]
-        P = self._transformation_matrix()
-        self.hydrostatic_stiffness = self.add_dofs_labels_to_matrix(P @ block_diag(*individual_hs) @ P.T)
-
-    def compute_hydrostatics(self, rho_water=1025.0):
-        self._compute_mass(rho_water)
-        self._compute_hydrostatic_stiffness()
-
-    def compute_hydrodynamics(self,
-                              omega_range=np.linspace(2, 10, 40),
-                              wave_direction_range=[np.pi],
-                              rho_water=1025.0,
-                              ):
-        dataset = xr.Dataset(coords={
-            'omega': omega_range,
-            'wave_direction': wave_direction_range,
-            'radiating_dof': list(self.dofs),
-            'rho': rho_water,
-        })
-        self.dataset = cpt.Nemoh(linear_solver="gmres").fill_dataset(dataset, [self])
-
-        # Reorder dofs
-        self.dataset = self.dataset.sel(radiating_dof=self.dofs_names, influenced_dof=self.dofs_names)
-
-        return self.dataset
-
-    ####################
-    # MOTION AND POWER #
-    ####################
-
-    def _compute_pto(self, pto=None):
-        if pto is None:
-            pto = {
-                'body_1__Relative_Pitch': 10,
-                'body_3__Relative_Pitch': 16,
-            }
-        non_pto_dofs = set(self.dofs) - set(pto.keys())
-        pto.update({dof: 0.0 for dof in non_pto_dofs})
-        self.pto = xr.DataArray(pd.Series(pto), dims=["radiating_dof"])
-        self.Kpto = self.add_dofs_labels_to_matrix(
-            np.diag([self.pto.sel(radiating_dof=name) for name in self.dofs.keys()])
+    def pto_dissipation_matrix(self, pto):
+        return self.add_dofs_labels_to_matrix(
+            np.diag([pto[dof_name] if dof_name in pto else 0.0 for dof_name in self.dofs.keys()])
         )
 
-    def compute_motion(self, wave_amplitude=0.02, viscous_dissipation=None, pto=None):
-        self._compute_pto(pto)
-        self.dataset['PTO_matrix'] = self.Kpto
-
-        if viscous_dissipation is None:
-            viscous_dissipation = np.zeros(self.Kpto.shape)
-
-        rao = [cpt.post_pro.rao(
-            self.dataset, wave_direction=wave_direction, dissipation=self.dataset['PTO_matrix'] + viscous_dissipation
-        ) for wave_direction in self.dataset.coords["wave_direction"]]
-
-        self.dataset['RAO'] = xr.concat(rao, dim='wave_direction')
-        self.dataset['motion'] = wave_amplitude * self.dataset['RAO']
-        return self.dataset['motion']
-
-    def compute_power(self):
-        power_per_dof = 0.5 * self.dataset['PTO_matrix'].dot(np.square(np.abs(1j * self.dataset.coords['omega'] * self.dataset['motion'])))
-        self.dataset['power'] = power_per_dof.sum(dim="influenced_dof")
-        return self.dataset['power']
 
 
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    bd1 = cpt.RectangularParallelepiped(size=(3.0, 1.0, 1.0), resolution=(30, 10, 10))
+    bd2 = cpt.RectangularParallelepiped(size=(3.0, 1.0, 1.0), resolution=(30, 10, 10))
+    bd3 = cpt.RectangularParallelepiped(size=(3.0, 1.0, 1.0), resolution=(30, 10, 10))
+    # bd1.show()
+
+    hb = HingeBarge(components=[bd1, bd2, bd3], distance_between_bodies=0.1)
+    hb.compute_hydrostatics(rho_water=1025.0, g=9.81)
+    hb.keep_immersed_part()
+    # hb.animate({"Hinge_0": 0.1}, loop_duration=1.0).run()
+    # hb.animate({"Hinge_1": 0.1}, loop_duration=1.0).run()
+    # hb.animate({"Hinge_0": 0.1, "Hinge_1": -0.1}, loop_duration=1.0).run()
+
+    test_matrix = xr.Dataset(coords={
+        'omega': np.linspace(1.0, 5.0, 10),
+        'wave_direction': [0.0],
+        'radiating_dof': list(hb.dofs),
+        'rho': 1025.0,
+    })
+    dataset = cpt.BEMSolver().fill_dataset(test_matrix, [hb])
+    # print(dataset)
+
+    pto = {"Hinge_0": 6, "Hinge_1": 1}
+    rao = cpt.post_pro.rao(
+        dataset,
+        wave_direction=0.0,
+        dissipation=hb.pto_dissipation_matrix(pto),
+    )
+    wave_amplitude = 0.1
+    motion = wave_amplitude * rao
+
+    hb.animate(0.1 * rao.isel(omega=0), loop_duration=1.0).run()
+
+    power_per_dof = 0.5 * hb.pto_dissipation_matrix(pto) @ (np.square(np.abs(1j * dataset.coords['omega'] * motion)))
+    power = power_per_dof.sum(dim="influenced_dof")
+
+    import matplotlib.pyplot as plt
+    power.plot(ylim=(0, 10))
+    plt.show()
